@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ESP32 RC（ボタン＋ジョイスティック）</title>
+<style>
+  :root { --pad: 14px; }
+  body { font-family: system-ui,-apple-system,Segoe UI,Roboto,sans-serif; margin: 20px; }
+  h1 { font-size: 20px; text-align: center; margin: 0 0 10px; }
+  #topbar { display:flex; gap:12px; justify-content:center; align-items:center; margin-bottom: 10px; flex-wrap: wrap; }
+  #status { font-size: 14px; min-width: 8em; text-align:center; }
+  #speedWrap { display:flex; gap:8px; justify-content:center; align-items:center; margin: 8px 0 14px; flex-wrap: wrap; }
+  #speedNow { font-weight:600; }
+  #grid { display:grid; grid-template-columns:100px 100px 100px; grid-template-rows:80px 80px 80px; gap:12px; justify-content:center; align-items:center; }
+  button { padding:10px; font-size:18px; border-radius:10px; border:1px solid #999; background:#f0f0f0; transition: background 0.1s ease; touch-action: manipulation; }
+  button.pressed { background:#ffd966 !important; }
+  #pad { position: fixed; right: var(--pad); bottom: var(--pad); width: 200px; height: 200px;
+         border-radius: 16px; background: #fafafa; border: 1px solid #ccc;
+         touch-action: none; user-select: none; }
+  #stick { position:absolute; width:84px; height:84px; border-radius:50%;
+           background:#e0e0e0; border:1px solid #bbb; left:58px; top:58px; }
+  #axes { position: fixed; right: var(--pad); bottom: calc(200px + var(--pad) + 8px); font-size: 12px; color:#555; text-align:right; white-space: pre; }
+  #hint { margin-top: 6px; text-align:center; font-size:12px; color:#666; }
+</style>
+</head>
+<body>
+  <h1>ESP32 RC（ボタン＋ジョイスティック）</h1>
+
+  <div id="topbar">
+    <button id="btnConnect">接続</button>
+    <button id="btnDisconnect">切断</button>
+    <div id="status">未接続</div>
+  </div>
+
+  <div id="speedWrap">
+    <button id="spd1">低速(1)</button>
+    <button id="spd2">中速(2)</button>
+    <button id="spd3">高速(3)</button>
+    <span id="speedNow">現在: -</span>
+  </div>
+
+  <div id="grid">
+    <div></div>              <button id="btnF">前</button> <div></div>
+    <button id="btnL">左</button>  <div></div>             <button id="btnR">右</button>
+    <div></div>              <button id="btnB">後</button> <div></div>
+  </div>
+
+  <div id="axes">L:   0  R:   0</div>
+  <div id="pad" aria-label="joystick area">
+    <div id="stick"></div>
+  </div>
+
+  <div id="hint">スティック＝ドラッグで連続操作 / キーボード WASD でも操作可</div>
+
+<script>
+(() => {
+  // ====== BLE (Nordic UART-like) ======
+  const SERVICE_UUID    = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+  const CHAR_WRITE_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+  let device = null, server = null, writeChar = null, canWriteNR = false;
+
+  const $ = id => document.getElementById(id);
+  const status = t => { $('status').textContent = t; };
+
+  async function connect() {
+    try {
+      status('接続要求…');
+      device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE_UUID] }] });
+      device.addEventListener('gattserverdisconnected', onDisconnected);
+      status('接続中…');
+      server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE_UUID);
+      writeChar = await service.getCharacteristic(CHAR_WRITE_UUID);
+      // writeValueWithoutResponse が使えるか判定（optional）
+      canWriteNR = !!writeChar.writeValueWithoutResponse;
+      status('接続完了');
+    } catch (e) {
+      console.error(e);
+      status('接続失敗');
+    }
+  }
+
+  async function disconnect() {
+    try {
+      await sendStop(); // 念のため停止
+      if (device && device.gatt.connected) device.gatt.disconnect();
+    } catch (e) {
+      console.warn(e);
+    } finally {
+      status('未接続');
+    }
+  }
+
+  function onDisconnected() {
+    status('切断 -> 停止');
+    sendStop();
+  }
+
+  async function writeBytes(u8) {
+    if (!writeChar) { status('未接続'); return; }
+    try {
+      if (canWriteNR) {
+        await writeChar.writeValueWithoutResponse(u8);
+      } else {
+        await writeChar.writeValue(u8);
+      }
+    } catch (e) {
+      console.error(e);
+      status('送信失敗');
+    }
+  }
+
+  // ====== 単発（既存互換：F/B/L/R/S/1/2/3） ======
+  const C = { F:70,B:66,L:76,R:82,S:83,'1':49,'2':50,'3':51 };
+  async function sendChar(c) {
+    await writeBytes(new Uint8Array([C[c]]));
+  }
+  const sendStop = () => sendChar('S');
+
+  // ====== ジョイスティック送信（'J', int8 L, int8 R） ======
+  // 送信周期（Hz）
+  const TX_HZ = 30;
+  const TX_MS = Math.round(1000 / TX_HZ);
+  let joyActive = false;
+  let joyLeft = 0, joyRight = 0; // -100..+100
+  let lastSent = 0;
+
+  function packJFrame(L, R) {
+    // int8 に丸める
+    const l = Math.max(-100, Math.min(100, Math.round(L)));
+    const r = Math.max(-100, Math.min(100, Math.round(R)));
+    return new Uint8Array([ 'J'.charCodeAt(0), (l & 0xff), (r & 0xff) ]);
+  }
+
+  async function tickSend() {
+    const now = performance.now();
+    if (writeChar && (joyActive || (now - lastSent < 250))) {
+      // joyActive 中は常送信、離した後も少しだけ 0 を送って減速を滑らかに
+      const frame = packJFrame(joyLeft, joyRight);
+      await writeBytes(frame);
+      lastSent = now;
+    }
+  }
+  setInterval(tickSend, TX_MS);
+
+  // ====== UI: ボタン ======
+  function bindPressRelease(btnId, code) {
+    const el = $(btnId);
+    const down = () => { sendChar(code); el.classList.add('pressed'); };
+    const up   = () => { sendStop(); el.classList.remove('pressed'); };
+    el.addEventListener('touchstart', e => { e.preventDefault(); down(); }, {passive:false});
+    el.addEventListener('touchend',   e => { e.preventDefault(); up();   }, {passive:false});
+    el.addEventListener('mousedown',  down);
+    el.addEventListener('mouseup',    up);
+    el.addEventListener('mouseleave', up);
+  }
+
+  $('btnConnect').addEventListener('click', connect);
+  $('btnDisconnect').addEventListener('click', disconnect);
+  bindPressRelease('btnF','F');
+  bindPressRelease('btnB','B');
+  bindPressRelease('btnL','L');
+  bindPressRelease('btnR','R');
+
+  $('spd1').addEventListener('click', ()=>{ sendChar('1'); $('speedNow').textContent='現在: 低速(1)'; });
+  $('spd2').addEventListener('click', ()=>{ sendChar('2'); $('speedNow').textContent='現在: 中速(2)'; });
+  $('spd3').addEventListener('click', ()=>{ sendChar('3'); $('speedNow').textContent='現在: 高速(3)'; });
+
+  if (!navigator.bluetooth) {
+    status('Web Bluetooth未対応（Chrome/Edge/Android推奨）');
+  }
+
+  // ====== UI: 仮想ジョイスティック ======
+  // 物理モデル：スティック視点（x:左右, y:前後）
+  // 速度（前後）= y、旋回 = x、左右差で L/R に変換（差動）
+  const pad = $('pad');
+  const stick = $('stick');
+  const axes = $('axes');
+
+  const PAD = { w:200, h:200, cx:100, cy:100, r:80 }; // 半径80の操作円
+  const STK_R = 42;
+
+  function setStick(x, y) { // pad座標
+    const left = Math.max(STK_R, Math.min(PAD.w - STK_R, x));
+    const top  = Math.max(STK_R, Math.min(PAD.h - STK_R, y));
+    stick.style.left = (left - STK_R) + 'px';
+    stick.style.top  = (top  - STK_R) + 'px';
+  }
+  function resetStick() { setStick(PAD.cx, PAD.cy); }
+
+  function norm(v, maxAbs) {
+    return Math.max(-1, Math.min(1, v / maxAbs));
+  }
+
+  function updateFromPointer(px, py) {
+    // 原点(=PAD中心)からの相対
+    const dx = px - PAD.cx;
+    const dy = py - PAD.cy;
+    // 操作円の内側へクランプ
+    const len = Math.hypot(dx, dy);
+    const k = len > PAD.r ? PAD.r / len : 1;
+    const ux = dx * k, uy = dy * k;
+    setStick(PAD.cx + ux, PAD.cy + uy);
+
+    // 上が前（yマイナスが前）になるよう符号反転
+    const x = norm(ux, PAD.r);
+    const y = norm(-uy, PAD.r);
+
+    // 差動：前後 = y、旋回 = x
+    // L = y - x、R = y + x を -100..100 にマップ
+    let L = (y - x) * 100;
+    let R = (y + x) * 100;
+
+    // デッドゾーン
+    const DZ = 4;
+    if (Math.abs(L) < DZ) L = 0;
+    if (Math.abs(R) < DZ) R = 0;
+
+    joyLeft = L;
+    joyRight = R;
+    axes.textContent = `L:${L.toString().padStart(4)}  R:${R.toString().padStart(4)}`;
+  }
+
+  function pointerXY(ev) {
+    const rect = pad.getBoundingClientRect();
+    const x = (ev.touches ? ev.touches[0].clientX : ev.clientX) - rect.left;
+    const y = (ev.touches ? ev.touches[0].clientY : ev.clientY) - rect.top;
+    return {x, y};
+  }
+
+  function startJoy(ev) {
+    ev.preventDefault();
+    joyActive = true;
+    const {x, y} = pointerXY(ev);
+    updateFromPointer(x, y);
+  }
+  function moveJoy(ev) {
+    if (!joyActive) return;
+    ev.preventDefault();
+    const {x, y} = pointerXY(ev);
+    updateFromPointer(x, y);
+  }
+  function endJoy() {
+    joyActive = false;
+    joyLeft = 0; joyRight = 0;
+    resetStick();
+    axes.textContent = `L:${'0'.padStart(4)}  R:${'0'.padStart(4)}`;
+  }
+
+  pad.addEventListener('pointerdown', startJoy);
+  window.addEventListener('pointermove', moveJoy);
+  window.addEventListener('pointerup',   endJoy);
+  pad.addEventListener('touchstart', startJoy, {passive:false});
+  window.addEventListener('touchmove',  moveJoy, {passive:false});
+  window.addEventListener('touchend',   endJoy, {passive:false});
+
+  resetStick();
+
+  // ====== キーボード（WASD）補助 ======
+  const keyState = { w:false, a:false, s:false, d:false };
+  function keysToAxes() {
+    const y = (keyState.w ? 1 : 0) + (keyState.s ? -1 : 0);
+    const x = (keyState.d ? 1 : 0) + (keyState.a ? -1 : 0);
+    // 同じ差動式
+    joyLeft  = (y - x) * 100;
+    joyRight = (y + x) * 100;
+    axes.textContent = `L:${joyLeft.toString().padStart(4)}  R:${joyRight.toString().padStart(4)}`;
+    // スティックも連動表示
+    setStick(PAD.cx + x * PAD.r, PAD.cy - y * PAD.r);
+  }
+  window.addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    if (k==='w'||k==='a'||k==='s'||k==='d') { keyState[k]=true; joyActive=true; keysToAxes(); }
+  });
+  window.addEventListener('keyup', (e) => {
+    const k = e.key.toLowerCase();
+    if (k==='w'||k==='a'||k==='s'||k==='d') {
+      keyState[k]=false;
+      const moving = keyState.w||keyState.a||keyState.s||keyState.d;
+      if (moving) { keysToAxes(); }
+      else { joyActive=false; endJoy(); }
+    }
+  });
+})();
+</script>
+</body>
+</html>
