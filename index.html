@@ -3,102 +3,241 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>BLE Remote（速度ボタン付き v2）</title>
+<title>BLE Joystick Remote (ESP32)</title>
 <style>
-  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 20px; }
-  h1 { font-size: 20px; text-align: center; }
-  #connectWrap { text-align: center; margin-bottom: 8px; }
-  #status { margin-top: 4px; font-size: 14px; }
-  #speedWrap { display: flex; gap: 8px; justify-content: center; align-items: center; margin-bottom: 12px; }
-  #speedNow { font-weight: 600; }
-  #grid { display: grid; grid-template-columns: 100px 100px 100px; grid-template-rows: 80px 80px 80px; gap: 12px; justify-content: center; align-items: center; }
-  button { padding: 10px; font-size: 18px; border-radius: 10px; border: 1px solid #999; background: #f0f0f0; transition: background 0.1s ease; }
-  button.pressed { background: #ffd966 !important; }
+  :root { --size: 220px; --knob: 70px; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 18px; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  #row { display: grid; grid-template-columns: 1fr; gap: 16px; }
+  #conn { display:flex; gap:8px; align-items:center; }
+  #status { font-size: 14px; }
+  button, input[type=range] { font-size: 16px; }
+  #padWrap { display:flex; justify-content:center; align-items:center; }
+  #pad {
+    position: relative; width: var(--size); height: var(--size);
+    background: radial-gradient(circle at center, #f8f8f8, #e6e6e6);
+    border-radius: 12px; border: 1px solid #bbb;
+    touch-action: none; user-select: none;
+    box-shadow: inset 0 0 0 1px #ddd, inset 0 0 40px rgba(0,0,0,0.04);
+  }
+  #grid {
+    position:absolute; inset:10px;
+    background:
+      linear-gradient(#ddd,#ddd) 50% 0/1px 100% no-repeat,
+      linear-gradient(#ddd,#ddd) 0 50%/100% 1px no-repeat,
+      radial-gradient(circle at 50% 50%, rgba(0,0,0,0.06) 0 2px, transparent 2px);
+    border-radius:8px;
+  }
+  #knob {
+    position:absolute; width: var(--knob); height: var(--knob);
+    left: calc(50% - var(--knob)/2); top: calc(50% - var(--knob)/2);
+    background: #fff; border-radius: 999px; border: 1px solid #bbb;
+    box-shadow: 0 6px 12px rgba(0,0,0,0.15), inset 0 0 0 1px #eee;
+    pointer-events: none;
+  }
+  #readout { text-align:center; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:13px; }
+  #controls { display:flex; gap:10px; align-items:center; justify-content:center; flex-wrap:wrap; }
+  #maxLabel { font-size: 13px; opacity: 0.8; }
 </style>
 </head>
 <body>
-  <h1>BLE Remote（速度ボタン付き v2）</h1>
-  <div id="connectWrap">
-    <button id="btnConnect">接続</button>
-    <div id="status">未接続</div>
+  <h1>BLE Joystick Remote（FPS風スティック）</h1>
+  <div id="row">
+    <div id="conn">
+      <button id="btnConnect">接続</button>
+      <button id="btnCenter">センター(停止)</button>
+      <div id="status">未接続</div>
+    </div>
+
+    <div id="padWrap">
+      <div id="pad" aria-label="joystick pad">
+        <div id="grid"></div>
+        <div id="knob"></div>
+      </div>
+    </div>
+
+    <div id="controls">
+      <label id="maxLabel">最大速度:</label>
+      <input id="maxRange" type="range" min="30" max="100" value="80" />
+      <span id="maxVal">80%</span>
+      <label id="sendHzLabel">送信Hz:</label>
+      <input id="hzRange" type="range" min="5" max="40" value="20" />
+      <span id="hzVal">20Hz</span>
+    </div>
+
+    <div id="readout">L=0 R=0 / x=0 y=0</div>
   </div>
-  <div id="speedWrap">
-    <button id="spd1">低速(1)</button>
-    <button id="spd2">中速(2)</button>
-    <button id="spd3">高速(3)</button>
-    <span id="speedNow">現在: -</span>
-  </div>
-  <div id="grid">
-    <div></div>
-    <button id="btnF">前</button>
-    <div></div>
-    <button id="btnL">左</button>
-    <div></div>
-    <button id="btnR">右</button>
-    <div></div>
-    <button id="btnB">後</button>
-    <div></div>
-  </div>
+
 <script>
 (() => {
+  // UUIDs (Nordic UART-like)
   const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
   const CHAR_WRITE_UUID = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
-  let writeChar = null;
 
-  const $ = id => document.getElementById(id);
-  const status = t => { $('status').textContent = t; };
+  let device=null, server=null, writeChar=null;
+  const $ = (id)=>document.getElementById(id);
+  const status = (t)=>{ $('status').textContent = t; };
 
-  async function connect() {
-    try {
-      status('接続中…');
-      const device = await navigator.bluetooth.requestDevice({
-        filters: [{ services: [SERVICE_UUID] }]
+  // Joystick state
+  const pad = $('pad'), knob = $('knob'), grid = $('grid');
+  let center = {x:0, y:0, r:0};
+  let stick = {x:0, y:0}; // normalized -1..+1 (x右+, y前+)
+  let pressed = false;
+  let maxPct = 80; // GUI scale
+  let sendHz = 20;
+  let lastSent = {l:0, r:0};
+  let timer = null;
+
+  function layout() {
+    const rect = pad.getBoundingClientRect();
+    const gridRect = grid.getBoundingClientRect();
+    center.x = rect.width/2;
+    center.y = rect.height/2;
+    center.r = Math.min(rect.width, rect.height)/2 - parseFloat(getComputedStyle(knob).width)/2 - 8;
+    // adjust grid size to full pad with 10px inset (already via CSS)
+  }
+  window.addEventListener('resize', layout);
+  layout();
+
+  // Touch/mouse handlers
+  function setKnob(x, y) {
+    knob.style.left = `${x - knob.offsetWidth/2}px`;
+    knob.style.top  = `${y - knob.offsetHeight/2}px`;
+  }
+  function clamp(v,min,max){ return v<min?min:(v>max?max:v); }
+
+  function updateFromPointer(px, py) {
+    const rect = pad.getBoundingClientRect();
+    const x = px - rect.left;
+    const y = py - rect.top;
+    // vector from center
+    let dx = x - center.x;
+    let dy = y - center.y;
+    // clamp to circle
+    const len = Math.hypot(dx, dy) || 1;
+    const max = center.r;
+    if (len > max) { dx *= max/len; dy *= max/len; }
+    setKnob(center.x + dx, center.y + dy);
+
+    // normalize to -1..1, and convert screen Y (down+) to forward Y(前+)
+    const nx = dx / max;
+    const ny = -dy / max;
+    const dead = 0.08;
+    const mag = Math.hypot(nx, ny);
+    if (mag < dead) { stick.x = 0; stick.y = 0; }
+    else {
+      const scale = (mag - dead)/(1-dead);
+      stick.x = clamp(nx, -1, 1) * scale;
+      stick.y = clamp(ny, -1, 1) * scale;
+    }
+  }
+
+  pad.addEventListener('touchstart', (e)=>{
+    e.preventDefault(); pressed=true;
+    const t = e.changedTouches[0];
+    updateFromPointer(t.clientX, t.clientY);
+  }, {passive:false});
+  pad.addEventListener('touchmove', (e)=>{
+    e.preventDefault();
+    const t = e.changedTouches[0];
+    updateFromPointer(t.clientX, t.clientY);
+  }, {passive:false});
+  pad.addEventListener('touchend', (e)=>{
+    e.preventDefault(); pressed=false; centerKnob();
+  }, {passive:false});
+  pad.addEventListener('mousedown', (e)=>{
+    pressed=true; updateFromPointer(e.clientX, e.clientY);
+  });
+  window.addEventListener('mousemove', (e)=>{ if (pressed) updateFromPointer(e.clientX, e.clientY); });
+  window.addEventListener('mouseup', ()=>{ if (pressed){ pressed=false; centerKnob(); } });
+
+  function centerKnob(){
+    setKnob(center.x, center.y);
+    stick.x = 0; stick.y = 0;
+  }
+  $('btnCenter').addEventListener('click', ()=>centerKnob());
+
+  // Diff-drive mixing: left = y + x, right = y - x
+  function mixAndScale(){
+    const maxScale = maxPct/100;
+    let l = (stick.y + stick.x) * 100 * maxScale;
+    let r = (stick.y - stick.x) * 100 * maxScale;
+    l = Math.max(-100, Math.min(100, l));
+    r = Math.max(-100, Math.min(100, r));
+    return {l: Math.round(l), r: Math.round(r)};
+  }
+
+  async function connect(){
+    try{
+      status('デバイス検索中…');
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{ services: [SERVICE_UUID] }],
+        optionalServices: [SERVICE_UUID]
       });
-      status('接続…');
-      const server = await device.gatt.connect();
+      device.addEventListener('gattserverdisconnected', ()=>{
+        status('切断されました');
+        device=server=writeChar=null;
+        stopSender();
+      });
+      status('接続中…');
+      server = await device.gatt.connect();
       const service = await server.getPrimaryService(SERVICE_UUID);
       writeChar = await service.getCharacteristic(CHAR_WRITE_UUID);
-      status('接続完了');
-    } catch (e) {
+      status('接続完了: ' + (device.name || 'ESP32'));
+
+      startSender();
+    }catch(e){
       console.error(e);
-      status('接続失敗');
+      status('接続失敗: ' + e.message);
     }
   }
 
-  async function sendByte(code) {
-    if (!writeChar) { status('未接続'); return; }
-    try {
-      await writeChar.writeValue(new Uint8Array([code]));
-    } catch (e) {
+  async function sendLR(l, r){
+    if (!writeChar) return;
+    try{
+      // Frame: 'J' (0x4A) + int8 left + int8 right
+      const buf = new Uint8Array(3);
+      buf[0] = 0x4A; // 'J'
+      buf[1] = (l & 0xFF);
+      buf[2] = (r & 0xFF);
+      await writeChar.writeValue(buf);
+    }catch(e){
       console.error(e);
-      status('送信失敗');
+      status('送信失敗: ' + e.message);
+      stopSender();
     }
   }
 
-  const C = { F:70,B:66,L:76,R:82,S:83,'1':49,'2':50,'3':51 };
-  function bindPressRelease(btnId, code) {
-    const el = $(btnId);
-    const down = () => { sendByte(C[code]); el.classList.add('pressed'); };
-    const up = () => { sendByte(C['S']); el.classList.remove('pressed'); };
-    el.addEventListener('touchstart', e => { e.preventDefault(); down(); }, {passive:false});
-    el.addEventListener('touchend', e => { e.preventDefault(); up(); }, {passive:false});
-    el.addEventListener('mousedown', e => { down(); });
-    el.addEventListener('mouseup', e => { up(); });
-    el.addEventListener('mouseleave', e => { up(); });
+  function startSender(){
+    stopSender();
+    const interval = Math.max(5, Math.min(40, sendHz));
+    const ms = Math.round(1000/interval);
+    timer = setInterval(()=>{
+      const {l, r} = mixAndScale();
+      $('readout').textContent = `L=${l} R=${r} / x=${(stick.x*100)|0} y=${(stick.y*100)|0}`;
+      // Send only if changed or stick pressed; also send zero when released
+      if (l !== lastSent.l || r !== lastSent.r){
+        sendLR(l, r);
+        lastSent = {l, r};
+      }
+    }, ms);
+  }
+  function stopSender(){
+    if (timer){ clearInterval(timer); timer=null; }
+    lastSent = {l:9999, r:9999}; // force next change
   }
 
   $('btnConnect').addEventListener('click', connect);
-  bindPressRelease('btnF','F');
-  bindPressRelease('btnB','B');
-  bindPressRelease('btnL','L');
-  bindPressRelease('btnR','R');
+  const maxRange = $('maxRange');
+  maxRange.addEventListener('input', ()=>{ maxPct = Number(maxRange.value); $('maxVal').textContent = maxPct + '%'; });
+  const hzRange = $('hzRange');
+  hzRange.addEventListener('input', ()=>{ sendHz = Number(hzRange.value); $('hzVal').textContent = sendHz + 'Hz'; if (writeChar) startSender(); });
 
-  $('spd1').addEventListener('click', ()=>{ sendByte(C['1']); $('speedNow').textContent='現在: 低速(1)'; });
-  $('spd2').addEventListener('click', ()=>{ sendByte(C['2']); $('speedNow').textContent='現在: 中速(2)'; });
-  $('spd3').addEventListener('click', ()=>{ sendByte(C['3']); $('speedNow').textContent='現在: 高速(3)'; });
+  // Layout knob initially
+  centerKnob();
 
   if (!navigator.bluetooth) {
-    status('Web Bluetooth未対応');
+    status('このブラウザはWeb Bluetoothに未対応です。AndroidはChrome、iOSはBluefy等を使用してください。');
   }
 })();
 </script>
